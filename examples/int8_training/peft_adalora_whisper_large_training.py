@@ -186,16 +186,15 @@ def parse_args():
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument(
-        "--evaluation_steps",
-        type=int,
-        default=500,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
         help="If the training should continue from a checkpoint folder.",
+    )
+    parser.add_argument(
+        "--run_eval_at_each_epoch",
+        action="store_true",
+        help="Whether to run eval loop at each epoch",
     )
 
     # lora/adalora specific args
@@ -274,6 +273,9 @@ def parse_args():
     if args.push_to_hub:
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
+    if args.load_best_model and not args.run_eval_at_each_epoch:
+        raise ValueError("Cannot load best model if `--run_eval_at_each_epoch` is not passed.")
+
     return args
 
 
@@ -320,8 +322,8 @@ def prepare_dataset_wrapper(do_lower_case, do_remove_punctuation, processor, nor
 
 
 def save_model_hook(models, weights, output_dir):
-    for model in models:
-        model.save_pretrained(output_dir)
+    for i, model in enumerate(models):
+        model.save_pretrained(output_dir, state_dict=weights[i])
         # make sure to pop weight so that corresponding model is not saved again
         weights.pop()
 
@@ -330,7 +332,8 @@ def load_model_hook(models, input_dir):
     while len(models) > 0:
         model = models.pop()
         # pop models so that they are not loaded again
-        PeftModel.from_pretrained(model.base_model.model, input_dir)
+        if hasattr(model, "active_adapter") and hasattr(model, "load_adapter"):
+            model.load_adapter(input_dir, model.active_adapter, is_trainable=True)
 
 
 @dataclass
@@ -587,7 +590,7 @@ def main():
             config = LoraConfig(
                 r=args.r,
                 lora_alpha=args.lora_alpha,
-                target_modules=["q_proj", "v_proj"],
+                target_modules=["k_proj", "q_proj", "v_proj", "out_proj"],
                 lora_dropout=args.lora_dropout,
             )
 
@@ -623,6 +626,11 @@ def main():
     if args.use_peft and args.use_adalora:
         model.base_model.peft_config["default"].total_step = args.max_train_steps
         # model.base_model.peft_config.total_step = args.max_train_steps
+
+    # Figure out how many steps we should save the Accelerator states
+    checkpointing_steps = args.checkpointing_steps
+    if checkpointing_steps is not None and checkpointing_steps.isdigit():
+        checkpointing_steps = int(checkpointing_steps)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -685,36 +693,26 @@ def main():
                 # Hence being called before optimizer.zero_grad().
                 if args.use_peft and args.use_adalora:
                     model.update_and_allocate(global_step)
-
                 optimizer.zero_grad()
-                global_step += 1
-                progress_bar.update(1)
+
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    progress_bar.update(1)
 
             if args.with_tracking:
                 step_loss = accelerator.reduce(loss.detach().clone()).item()
                 total_loss += step_loss
                 running_loss += step_loss
 
-            if global_step % args.checkpointing_steps == 0:
-                output_dir = os.path.join(args.output_dir, f"step_{global_step}")
-                accelerator.save_state(output_dir)
+            if isinstance(checkpointing_steps, int):
+                if global_step % checkpointing_steps == 0:
+                    output_dir = os.path.join(args.output_dir, f"step_{global_step}")
+                    accelerator.save_state(output_dir)
 
             if global_step % args.logging_steps == 0:
                 if args.with_tracking:
                     accelerator.log({"train/running_loss": running_loss / args.logging_steps}, step=global_step)
                     running_loss = 0
-
-            if global_step % args.evaluation_steps == 0:
-                eval_metrics = evaluation_loop(
-                    model, eval_dataloader, processor, normalizer, metric, forced_decoder_ids, accelerator
-                )
-                if args.with_tracking:
-                    logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
-                    accelerator.log(eval_metrics, step=global_step)
-                if best_metric is None or eval_metrics["eval/wer"] < best_metric:
-                    best_metric = eval_metrics["eval/wer"]
-                    accelerator.save_state(os.path.join(args.output_dir, "best_checkpoint"))
-                model.train()
 
             if global_step >= args.max_train_steps:
                 break
@@ -722,13 +720,9 @@ def main():
         if args.with_tracking:
             train_epoch_loss = total_loss / (step + 1)
             logger.info(f"Epoch {epoch} train loss: {train_epoch_loss}")
-            accelerator.log({"epoch/train_loss": train_epoch_loss}, step=epoch)
+            accelerator.log({"train/epoch_loss": train_epoch_loss}, step=epoch)
 
-        if args.push_to_hub and epoch <= args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(args.output_dir, is_main_process=accelerator.is_main_process)
-            # evaluate the model at the end of training
+        if args.run_eval_at_each_epoch or epoch == (args.num_train_epochs - 1):
             eval_metrics = evaluation_loop(
                 model, eval_dataloader, processor, normalizer, metric, forced_decoder_ids, accelerator
             )
@@ -738,17 +732,31 @@ def main():
             if best_metric is None or eval_metrics["eval/wer"] < best_metric:
                 best_metric = eval_metrics["eval/wer"]
                 accelerator.save_state(os.path.join(args.output_dir, "best_checkpoint"))
+            model.train()
 
+        if args.output_dir is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            state_dict = accelerator.get_state_dict(unwrapped_model)
             if accelerator.is_main_process:
+                if isinstance(checkpointing_steps, str):
+                    accelerator.save_state(os.path.join(args.output_dir, f"epoch_{epoch}"))
+                unwrapped_model.save_pretrained(args.output_dir, state_dict=state_dict)
                 processor.tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
+                if args.push_to_hub:
+                    commit_message = (
+                        f"Training in progress epoch {epoch}"
+                        if epoch < args.num_train_epochs - 1
+                        else "End of training"
+                    )
+                    repo.push_to_hub(commit_message=commit_message, blocking=False, auto_lfs_prune=True)
+            accelerator.wait_for_everyone()
 
     if args.load_best_model:
         # load the best model
         accelerator.load_state(os.path.join(args.output_dir, "best_checkpoint"))
-        model.resize_modules_by_rank_pattern(model.peft_config["default"].rank_pattern, "default")
+        if args.use_peft and args.use_adalora:
+            model.resize_modules_by_rank_pattern(model.peft_config["default"].rank_pattern, "default")
         eval_metrics = evaluation_loop(
             model, eval_dataloader, processor, normalizer, metric, forced_decoder_ids, accelerator
         )
@@ -756,17 +764,21 @@ def main():
             best_metrics = {"best_" + k: v for k, v in eval_metrics.items()}
             accelerator.log(best_metrics, step=global_step)
 
-    accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.save_pretrained(args.output_dir, is_main_process=accelerator.is_main_process)
-    if accelerator.is_main_process:
-        processor.tokenizer.save_pretrained(args.output_dir)
-        if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        state_dict = accelerator.get_state_dict(unwrapped_model)
+        if accelerator.is_main_process:
+            unwrapped_model.save_pretrained(args.output_dir, state_dict=state_dict)
+            processor.tokenizer.save_pretrained(args.output_dir)
+            if args.push_to_hub:
+                repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+        accelerator.wait_for_everyone()
 
     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
         eval_metrics.pop("eval_samples")
         json.dump(eval_metrics, f)
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
