@@ -66,7 +66,7 @@ class LoraConfig(PeftConfig):
             pattern is not in the common layers pattern.
     """
 
-    r: int = field(default=16, metadata={"help": "Lora attention dimension"})
+    r: int = field(default=32, metadata={"help": "Lora attention dimension"})
     target_modules: Optional[Union[List[str], str]] = field(
         default=None,
         metadata={
@@ -473,7 +473,7 @@ class LoraModel(torch.nn.Module):
 
         return self.model
 
-    def add_weighted_adapter(self, adapters, weights, adapter_name, combination_type="svd"):
+    def add_weighted_adapter(self, adapters, weights, adapter_name, combination_type="linear"):
         """
         This method adds a new adapter by merging the given adapters with the given weights.
 
