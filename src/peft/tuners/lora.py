@@ -66,7 +66,7 @@ class LoraConfig(PeftConfig):
             pattern is not in the common layers pattern.
     """
 
-    r: int = field(default=32, metadata={"help": "Lora attention dimension"})
+    r: int = field(default=1, metadata={"help": "Lora attention dimension"})
     target_modules: Optional[Union[List[str], str]] = field(
         default=None,
         metadata={
@@ -175,6 +175,7 @@ class LoraModel(torch.nn.Module):
     def __init__(self, model, config, adapter_name):
         super().__init__()
         self.model = model
+        print('hi')
         self.forward = self.model.forward
         self.peft_config = config
         self.add_adapter(adapter_name, self.peft_config[adapter_name])
