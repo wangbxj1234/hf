@@ -66,7 +66,7 @@ class LoraConfig(PeftConfig):
             pattern is not in the common layers pattern.
     """
 
-    r: int = field(default=8, metadata={"help": "Lora attention dimension"})
+    r: int = field(default=16, metadata={"help": "Lora attention dimension"})
     target_modules: Optional[Union[List[str], str]] = field(
         default=None,
         metadata={
